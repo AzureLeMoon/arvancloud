@@ -1,4 +1,4 @@
-module github.com/azurelemoon/arvancloud
+module github.com/libdns/arvancloud
 
 go 1.23.0
 
