@@ -5,4 +5,17 @@ Arvancloud for [`libdns`](https://github.com/libdns/libdns)
 
 This package implements the [libdns interfaces](https://github.com/libdns/libdns) for Arvancloud, allowing you to manage DNS records.
 
-TODO: Show how to configure and use. Explain any caveats.
+## Authenticating
+This package uses the Apikey authentication method.
+
+The provided apikey must have the `DNS administrator` and `DOMAIN administrator` permissions.
+
+placeholder
+
+## Example Configuration
+
+```golang
+p := arvancloud.Provider{
+    AuthAPIKey: "apikey",
+}
+```

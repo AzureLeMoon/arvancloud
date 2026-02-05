@@ -30,7 +30,7 @@ func newClient(authKey string) *client {
 		AuthAPIKey: authKey,
 		BaseURL:    apiBaseURL,
 		httpClient: &http.Client{
-			Timeout: time.Minute * 30,
+			Timeout: time.Second * 30,
 		},
 	}
 }
