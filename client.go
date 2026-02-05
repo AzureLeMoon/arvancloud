@@ -20,35 +20,44 @@ const (
 // client manages communication with the ArvanCloud API.
 type client struct {
 	AuthAPIKey string
-	BaseURL      string
-	httpClient   *http.Client
+	BaseURL    string
+	httpClient *http.Client
 }
 
 // newClient creates a new ArvanCloud API client.
 func newClient(authKey string) *client {
 	return &client{
 		AuthAPIKey: authKey,
-		BaseURL:      apiBaseURL,
+		BaseURL:    apiBaseURL,
 		httpClient: &http.Client{
-			Timeout: time.Second * 20,
+			Timeout: time.Minute * 30,
 		},
 	}
 }
 
-type paginatedResponse struct {
-	Data  []arDNSRecord `json:"data"`
-	Links struct {
-		Next *string `json:"next"`
-	} `json:"links"`
-	Meta struct {
-		CurrentPage int `json:"current_page"`
-		LastPage    int `json:"last_page"`
-	} `json:"meta"`
-}
+func (c *client) getDomains(ctx context.Context) ([]libdns.Zone, error) {
 
-type singleRecordResponse struct {
-	Data    arDNSRecord `json:"data"`
-	Message *string   `json:"message"`
+	u := "/domains"
+	req, err := c.newRequest(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var arDomains []arDomain
+	_, err = c.do(req, &arDomains)
+	if err != nil {
+		return nil, err
+	}
+
+	zones := make([]libdns.Zone, len(arDomains))
+	for i, arDomain := range arDomains {
+		zones[i] = libdns.Zone{
+			// Add trailing dot to make it a FQDN
+			Name: arDomain.Name + ".",
+		}
+	}
+
+	return zones, nil
 }
 
 // getRecords fetches DNS records for a zone.
@@ -63,49 +72,42 @@ func (c *client) getRecords(ctx context.Context, zone string) ([]arDNSRecord, er
 			return nil, err
 		}
 
-		var resp paginatedResponse
-		if _,err := c.do(req, &resp); err != nil {
+		var pageRecords []arDNSRecord
+		resp, err := c.do(req, &pageRecords)
+		if err != nil {
 			return nil, err
 		}
 
-		records = append(records, resp.Data...)
+		records = append(records, pageRecords...)
 
-		if resp.Links.Next == nil || resp.Meta.CurrentPage >= resp.Meta.LastPage {
+		if resp.Links.Next == nil || resp.Meta.CurrentPage >= resp.Meta.LastPage || len(pageRecords) == 0 {
 			break
 		}
 		page++
 	}
-
 	return records, nil
 }
 
+func (p *Provider) findExistingRecords(records []arDNSRecord, rec libdns.Record, zone string) []arDNSRecord {
 
-func (p *Provider) findExistingRecord(records []arDNSRecord, name, rType, zone string) *arDNSRecord {
-	searchName := libdns.AbsoluteName(name, zone)
+	arRec, err := arvancloudRecord(rec)
+	if err != nil {
+		return nil
+	}
+
+	var results []arDNSRecord
+
 	for i, r := range records {
-		// Arvan name usually comes as "sub" or "sub.domain.com" depending on context,
-		// but getRecords usually returns full name or relative?
-		// The spec says "name" in response.
-		// Let's assume absolute name matching or relative matching.
-		// Safest is to compare both normalized absolute names.
-
-		recordName := r.Name
-		if !strings.Contains(recordName, zone) && recordName != "@" {
-			// If record name is relative, make it absolute for comparison
-			if recordName == "@" {
-				recordName = zone
-			} else {
-				recordName = recordName + "." + zone
-			}
+		if r.Name == "@" {
+			r.Name = zone
 		}
-		recordName = strings.TrimSuffix(recordName, ".")
-
-		if strings.EqualFold(recordName, searchName) && strings.EqualFold(r.Type, rType) {
-			return &records[i]
+		if strings.EqualFold(r.Name, arRec.Name) && strings.EqualFold(r.Type, arRec.Type) {
+			results = append(results, records[i])
 		}
 	}
-	return nil
+	return results
 }
+
 // createRecord creates a new DNS record.
 func (c *client) createRecord(ctx context.Context, zone string, record libdns.Record) (arDNSRecord, error) {
 
@@ -114,22 +116,17 @@ func (c *client) createRecord(ctx context.Context, zone string, record libdns.Re
 		return arDNSRecord{}, err
 	}
 
-	jsonBytes, err := json.Marshal(arRec)
-	if err != nil {
-		return arDNSRecord{}, err
-	}
-
+	// fmt.Println(string(jsonBytes))
 	u := fmt.Sprintf("/domains/%s/dns-records", zone)
-	req, err := c.newRequest(ctx, http.MethodPost, u, bytes.NewReader(jsonBytes))
+	req, err := c.newRequest(ctx, http.MethodPost, u, arRec)
 	if err != nil {
 		return arDNSRecord{}, err
 	}
 
 	var resp arDNSRecord
-	if _,err := c.do(req, &resp); err != nil {
+	if _, err := c.do(req, &resp); err != nil {
 		return arDNSRecord{}, err
 	}
-
 	return resp, nil
 }
 
@@ -142,7 +139,7 @@ func (c *client) deleteRecord(ctx context.Context, zone string, recordID string)
 	}
 
 	var resp arDNSRecord
-	if _,err := c.do(req, &resp); err != nil {
+	if _, err := c.do(req, &resp); err != nil {
 		return arDNSRecord{}, err
 	}
 
@@ -157,21 +154,20 @@ func (c *client) updateRecord(ctx context.Context, zone string, recordID string,
 		return arDNSRecord{}, err
 	}
 
-	var resp singleRecordResponse
-	if _,err := c.do(req, &resp); err != nil {
+	var resp arDNSRecord
+	if _, err := c.do(req, &resp); err != nil {
 		return arDNSRecord{}, err
 	}
 
-	return resp.Data, nil
+	return resp, nil
 }
 
-func (c *client) do(req *http.Request, result any) (arResponse,error) {
+func (c *client) do(req *http.Request, result any) (arResponse, error) {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return arResponse{}, err
 	}
 	defer resp.Body.Close()
-
 
 	var respData arResponse
 
@@ -179,7 +175,7 @@ func (c *client) do(req *http.Request, result any) (arResponse,error) {
 	if err != nil {
 		return arResponse{}, err
 	}
-	
+
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
 		return arResponse{}, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
@@ -194,12 +190,15 @@ func (c *client) do(req *http.Request, result any) (arResponse,error) {
 		if err != nil {
 			return arResponse{}, err
 		}
+		respData.Data = nil
 	}
-	return respData ,nil
+
+	return respData, err
 }
 
 func (c *client) newRequest(ctx context.Context, method, url string, payload any) (*http.Request, error) {
 	var body []byte
+	var req *http.Request
 	var err error
 
 	if payload != nil {
@@ -207,13 +206,17 @@ func (c *client) newRequest(ctx context.Context, method, url string, payload any
 		if err != nil {
 			return nil, err
 		}
-	}
+		req, err = http.NewRequestWithContext(ctx, method, c.BaseURL+url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		req, err = http.NewRequestWithContext(ctx, method, c.BaseURL+url, nil)
+		if err != nil {
+			return nil, err
+		}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
 	}
-
 	req.Header.Set("Authorization", "Apikey "+c.AuthAPIKey)
 	req.Header.Set("Accept", "application/json")
 	if payload != nil {
@@ -230,9 +233,3 @@ func unwrapContent(content string) string {
 	return content
 }
 
-func wrapContent(content string) string {
-	if !strings.HasPrefix(content, `"`) && !strings.HasSuffix(content, `"`) {
-		content = fmt.Sprintf("%q", content)
-	}
-	return content
-}

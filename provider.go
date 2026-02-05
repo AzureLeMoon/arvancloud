@@ -4,8 +4,8 @@ package arvancloud
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/libdns/libdns"
@@ -16,8 +16,8 @@ type Provider struct {
 	// AuthAPIKey is the API token for ArvanCloud.
 	// It can be obtained from the ArvanCloud user panel.
 	AuthAPIKey string `json:"auth_api_key,omitempty"`
-	client *client
-	mu     sync.Mutex
+	client     *client
+	mu         sync.Mutex
 }
 
 // GetRecords lists all the records in the zone.
@@ -27,13 +27,13 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 		p.client = newClient(p.AuthAPIKey)
 	}
 	p.mu.Unlock()
-
+	zone = strings.TrimSuffix(zone, `.`)
 	arvanRecords, err := p.client.getRecords(ctx, zone)
 	if err != nil {
 		return nil, err
 	}
 
-	var records []libdns.Record
+	records := make([]libdns.Record, 0, len(arvanRecords))
 	for _, ar := range arvanRecords {
 		libRecord, err := ar.toLibDNSRecord(zone)
 		if err != nil {
@@ -51,10 +51,10 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		p.client = newClient(p.AuthAPIKey)
 	}
 	p.mu.Unlock()
-
+	zone = strings.TrimSuffix(zone, `.`)
 	var addedRecords []libdns.Record
 	for _, r := range records {
-		
+
 		result, err := p.client.createRecord(ctx, zone, r)
 		if err != nil {
 			return nil, err
@@ -63,7 +63,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 		if err != nil {
 			return nil, fmt.Errorf("parsing Arvancloud DNS record %+v: %v", r, err)
 		}
-		addedRecords = append(addedRecords, libRecord)	
+		addedRecords = append(addedRecords, libRecord)
 	}
 
 	return addedRecords, nil
@@ -72,44 +72,56 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 // SetRecords sets the records in the zone, either by updating existing records or creating new ones.
 // It returns the updated records.
 func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	// For simplicity and correctness with Arvan's array model, we delete existing records
-	// for the names/types provided and then append the new ones.
-	// This ensures the state matches exactly what is requested.
-
-	// 1. Find existing records for these names/types
-	// 2. Delete them
-	// 3. Append new ones
-
-	// Optimization: We can just call DeleteRecords then AppendRecords,
-	// but DeleteRecords requires exact value matching usually.
-	// Here we want to overwrite *all* records for a given Name+Type.
-
 	p.mu.Lock()
 	if p.client == nil {
 		p.client = newClient(p.AuthAPIKey)
 	}
 	p.mu.Unlock()
-
+	zone = strings.TrimSuffix(zone, `.`)
+	var results []libdns.Record
 	existingRecords, err := p.client.getRecords(ctx, zone)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, r := range records {
-		existing := p.findExistingRecord(existingRecords, r.RR().Name, r.RR().Type, zone)
-		if existing != nil {
-			_,err := p.client.deleteRecord(ctx, zone, existing.ID)
+		// check for existing records
+		existing := p.findExistingRecords(existingRecords, r, zone)
+		if len(existingRecords) > 0 && len(existing) == 0 {
+			// the record doesn't exist, create it
+			result, err := p.client.createRecord(ctx, zone, r)
 			if err != nil {
 				return nil, err
 			}
-			// Remove from local cache to avoid trying to delete again if multiple input records match same existing set
-			// (Though findExistingRecord returns a pointer, removing from slice is harder,
-			// but since we loop inputs, we might hit same ID twice.
-			// Arvan API might 404 on second delete, which we should ignore or handle.)
+			libRecord, err := result.toLibDNSRecord(zone)
+			if err != nil {
+				return nil, fmt.Errorf("parsing Arvancloud DNS record %+v: %v", r, err)
+			}
+			results = append(results, libRecord)
+			continue
 		}
+
+		if len(existing) > 1 {
+			return nil, fmt.Errorf("unexpectedly found more than 1 record for %v", r)
+		}
+
+		arRec, err := arvancloudRecord(r)
+		if err != nil {
+			return nil, err
+		}
+		result, err := p.client.updateRecord(ctx, zone, existing[0].ID, arRec)
+		if err != nil {
+			return nil, err
+		}
+		libRecord, err := result.toLibDNSRecord(zone)
+		if err != nil {
+			return nil, fmt.Errorf("parsing Arvancloud DNS record %+v: %v", r, err)
+
+		}
+		results = append(results, libRecord)
 	}
 
-	return p.AppendRecords(ctx, zone, records)
+	return results, nil
 }
 
 // DeleteRecords deletes the specified records from the zone. It returns the records that were deleted.
@@ -119,7 +131,7 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 		p.client = newClient(p.AuthAPIKey)
 	}
 	p.mu.Unlock()
-
+	zone = strings.TrimSuffix(zone, `.`)
 	existingRecords, err := p.client.getRecords(ctx, zone)
 	if err != nil {
 		return nil, err
@@ -128,76 +140,44 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 	var deletedRecords []libdns.Record
 
 	for _, r := range records {
-		existing := p.findExistingRecord(existingRecords, r.RR().Name, r.RR().Type, zone)
+		existing := p.findExistingRecords(existingRecords, r, zone)
 		if existing == nil {
 			continue
 		}
-		var result arDNSRecord
-		var libRecord libdns.Record
-		if r.RR().Type == "A" || r.RR().Type == "AAAA" {
-			// Handle array removal
-			var currentVals []ARecordValue
-			b, _ := json.Marshal(existing.Value)
-			_ = json.Unmarshal(b, &currentVals)
 
-			var newVals []ARecordValue
-			found := false
-			for _, v := range currentVals {
-				if v.IP == r.RR().Data {
-					found = true
-					continue // Skip the one we want to delete
-				}
-				newVals = append(newVals, v)
-			}
-
-			if found {
-				if len(newVals) == 0 {
-					// Empty list, delete the whole record
-					result, err = p.client.deleteRecord(ctx, zone, existing.ID)
-					if err != nil {
-						return nil, err
-					}
-					libRecord, err = result.toLibDNSRecord(zone)
-					if err != nil {
-						return nil, fmt.Errorf("parsing Arvancloud DNS record %+v: %v", r, err)
-					}
-				} else {
-					// Update with remaining values
-					existing.Value = newVals
-					result, err := p.client.updateRecord(ctx, zone, existing.ID, *existing)
-					if err != nil {
-						return nil, err
-					}
-					libRecord, err = result.toLibDNSRecord(zone)
-					if err != nil {
-						return nil, fmt.Errorf("parsing Arvancloud DNS record %+v: %v", r, err)
-					}		
-				}
-				deletedRecords = append(deletedRecords, libRecord)
-			}
-		} else {
-			// Simple delete
-			result, err := p.client.deleteRecord(ctx, zone, existing.ID)
+		for _, arRec := range existing {
+			_, err := p.client.deleteRecord(ctx, zone, arRec.ID)
 			if err != nil {
 				return nil, err
 			}
-			libRecord, err = result.toLibDNSRecord(zone)
-			if err != nil {
-				return nil, fmt.Errorf("parsing Arvancloud DNS record %+v: %v", r, err)
-			}				
-			deletedRecords = append(deletedRecords, libRecord)
+			deletedRecords = append(deletedRecords, r)
 		}
 	}
 
 	return deletedRecords, nil
 }
 
+func (p *Provider) ListZones(ctx context.Context) ([]libdns.Zone, error) {
 
+	p.mu.Lock()
+	if p.client == nil {
+		p.client = newClient(p.AuthAPIKey)
+	}
+	p.mu.Unlock()
 
+	arDomains, err := p.client.getDomains(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return arDomains, nil
+}
 // Interface guards
 var (
 	_ libdns.RecordGetter   = (*Provider)(nil)
 	_ libdns.RecordAppender = (*Provider)(nil)
 	_ libdns.RecordSetter   = (*Provider)(nil)
 	_ libdns.RecordDeleter  = (*Provider)(nil)
+	_ libdns.ZoneLister  	= (*Provider)(nil)
+
 )
