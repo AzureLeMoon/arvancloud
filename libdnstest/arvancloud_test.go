@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"testing"
 
 	"github.com/libdns/arvancloud"
@@ -8,8 +9,8 @@ import (
 )
 
 func TestArvancloudProvider(t *testing.T) {
-	apiToken := "2fcff0d4-8410-5f83-9355-1ef2e5ced509"
-	testZone := "netetkharabe.ir."
+	apiToken := os.Getenv("ARVANCLOUD_API_KEY")
+	testZone := os.Getenv("ARVANCLOUD_TEST_ZONE")
 
 	if apiToken == "" || testZone == "" {
 		t.Skip("Skipping Cloudflare provider tests: ARVANCLOUD_API_KEY and/or ARVANCLOUD_TEST_ZONE environment variables must be set")
